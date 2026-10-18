@@ -1,10 +1,59 @@
-#!/usr/bin/python3
-import psutil, os, signal, json, threading
-import argparse, sys, tomllib
+#!/usr/bin/env python3
+import sys, os, glob
+
+# Ensure psutil can be found even when running as a root daemon (e.g. launchd/systemd)
+# where user site-packages are not included in sys.path by default.
+try:
+    import psutil
+except ModuleNotFoundError:
+    candidates = []
+    sudo_user = os.environ.get("SUDO_USER")
+    home_dirs = [os.path.expanduser("~")]
+    if sudo_user:
+        home_dirs.append(os.path.expanduser(f"~{sudo_user}"))
+    if sys.platform == "darwin":
+        home_dirs.extend(glob.glob("/Users/*"))
+        for h in set(home_dirs):
+            candidates.extend(glob.glob(f"{h}/Library/Python/*/lib/python/site-packages"))
+    else:
+        home_dirs.extend(glob.glob("/home/*"))
+        for h in set(home_dirs):
+            candidates.extend(glob.glob(f"{h}/.local/lib/python*/site-packages"))
+    candidates.extend(glob.glob("/opt/homebrew/lib/python*/site-packages"))
+    candidates.extend(glob.glob("/usr/local/lib/python*/site-packages"))
+
+    found = False
+    for p in sorted(set(candidates), reverse=True):
+        if os.path.isdir(p) and p not in sys.path:
+            sys.path.insert(0, p)
+            try:
+                import psutil
+                found = True
+                break
+            except ModuleNotFoundError:
+                sys.path.remove(p)
+
+    if not found:
+        print("\033[91mpsutil library not found. Please run: pip install psutil\033[0m")
+        sys.exit(1)
+
+import signal, json, threading
+import argparse
 import time, sqlite3
 from datetime import datetime, timedelta
 from collections import defaultdict
-from tomllib import TOMLDecodeError
+
+try:
+    import tomllib
+    from tomllib import TOMLDecodeError
+except ImportError:
+    try:
+        import tomli as tomllib
+        from tomli import TOMLDecodeError
+    except ImportError:
+        tomllib = None
+        class TOMLDecodeError(Exception):
+            pass
 
 VERSION = "1.10.5"
 
@@ -18,7 +67,7 @@ GREEN = "\033[32m"
 RESET = "\033[0m"
 
 # Database file
-DIR = "/var/lib/nusgmon"
+DIR = os.environ.get("NUSGMON_DIR", "/var/lib/nusgmon")
 DB_FILE = os.path.join(DIR, "db.sqlite")
 
 # Config file
@@ -34,77 +83,149 @@ else:
 
 CFG_FILE = os.path.join(CFG_DIR, "config.toml") if CFG_DIR else None
 
+needs_db = not any(arg in sys.argv[1:] for arg in ("interfaces", "-h", "--help", "-V", "--version"))
+
+if not os.path.exists(DB_FILE) and os.geteuid() != 0 and needs_db:
+    print(f"\n  {YELLOW}No database file found at {DB_FILE}.{RESET}")
+    print(f"  The nusgmon recording service may still be starting or has not recorded data yet.")
+    print(f"  Please wait a few moments or run: sudo nusgmon record -w 3\n")
+    sys.exit(0)
+
 try:
     os.makedirs(DIR, exist_ok=True)
     os.makedirs(CFG_DIR, exist_ok=True) if CFG_DIR else None
     if os.geteuid() == 0:
         uid = int(os.environ.get("SUDO_UID", 0))
         gid = int(os.environ.get("SUDO_GID", 0))
+        os.chmod(DIR, 0o755)
         if uid and gid:
-            os.chmod(DIR, 0o754)
             os.chown(DIR, uid, gid)
-            os.chmod(CFG_DIR, 0o754)
-            os.chown(CFG_DIR, uid, gid)
+            if CFG_DIR:
+                os.chmod(CFG_DIR, 0o754)
+                os.chown(CFG_DIR, uid, gid)
 
 except PermissionError:
     print(f"{YELLOW}Please run the nusgmon as root once, I have to create few directories{RESET}")
     sys.exit(1)
 
-VIRTUAL_IFACE_PREFIXES = ("tun", "tap", "wg", "virbr", "docker", "veth", "br-", "lo")
+VIRTUAL_IFACE_PREFIXES = (
+    "tun", "tap", "wg", "virbr", "docker", "veth", "br-", "lo",
+    "utun", "awdl", "llw", "gif", "stf", "bridge", "ap", "anpi"
+)
 
 db_lock = threading.Lock()
-try:
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    if os.geteuid() == 0:
-        uid = int(os.environ.get("SUDO_UID", 0))
-        gid = int(os.environ.get("SUDO_GID", 0))
-        os.chmod(DB_FILE, 0o664)
-        if uid and gid:
-            os.chown(DB_FILE, uid, gid)
-    cur = conn.cursor()
-except sqlite3.OperationalError as e:
-    print(f"{YELLOW}{e}{RESET}")
-    sys.exit(1)
+conn = None
+cur = None
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS data_usage (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL,
-    bytes_sent INTEGER NOT NULL,
-    bytes_recv INTEGER NOT NULL,
-    iface TEXT DEFAULT 'all'
-)""")
+if needs_db or os.path.exists(DB_FILE) or os.geteuid() == 0:
+    try:
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        if os.geteuid() == 0:
+            uid = int(os.environ.get("SUDO_UID", 0))
+            gid = int(os.environ.get("SUDO_GID", 0))
+            os.chmod(DB_FILE, 0o666)
+            if uid and gid:
+                os.chown(DB_FILE, uid, gid)
+        cur = conn.cursor()
+    except sqlite3.OperationalError as e:
+        print(f"{YELLOW}{e}{RESET}")
+        sys.exit(1)
 
-cur.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON data_usage(timestamp)")
+    if os.geteuid() == 0 or not os.path.exists(DB_FILE):
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS data_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            bytes_sent INTEGER NOT NULL,
+            bytes_recv INTEGER NOT NULL,
+            iface TEXT DEFAULT 'all'
+        )""")
 
-try:
-    cur.execute("ALTER TABLE data_usage ADD COLUMN 'iface' TEXT")
-except sqlite3.OperationalError:
-    pass
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON data_usage(timestamp)")
 
-conn.commit()
+        try:
+            cur.execute("ALTER TABLE data_usage ADD COLUMN 'iface' TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        conn.commit()
+
+def load_simple_toml(f):
+    content = f.read().decode("utf-8")
+    data = {}
+    current_sec = data
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            sec_name = line[1:-1].strip()
+            data[sec_name] = {}
+            current_sec = data[sec_name]
+            continue
+        if "=" in line:
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if "#" in val:
+                in_quote = None
+                comment_idx = -1
+                for idx, ch in enumerate(val):
+                    if ch in ('"', "'"):
+                        if in_quote == ch:
+                            in_quote = None
+                        elif in_quote is None:
+                            in_quote = ch
+                    elif ch == "#" and in_quote is None:
+                        comment_idx = idx
+                        break
+                if comment_idx != -1:
+                    val = val[:comment_idx].strip()
+            if val.startswith("[") and val.endswith("]"):
+                items = [item.strip().strip('"').strip("'") for item in val[1:-1].split(",") if item.strip()]
+                current_sec[key] = items
+            elif (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                current_sec[key] = val[1:-1]
+            elif val.lower() == "true":
+                current_sec[key] = True
+            elif val.lower() == "false":
+                current_sec[key] = False
+            else:
+                try:
+                    if "." in val:
+                        current_sec[key] = float(val)
+                    else:
+                        current_sec[key] = int(val)
+                except ValueError:
+                    current_sec[key] = val
+    return data
 
 # config file reading handling
 if CFG_FILE and os.path.isfile(CFG_FILE):
     try:
         with open(CFG_FILE, "rb") as f:
-            conf = tomllib.load(f)
+            if tomllib is not None:
+                conf = tomllib.load(f)
+            else:
+                conf = load_simple_toml(f)
     except TOMLDecodeError as e:
         print(f"\n{RED}Config error: {e}{RESET}")
         sys.exit(1)
 else:
+    default_ifaces = ['en0', 'en1'] if sys.platform == 'darwin' else ['wlp2s0', 'enp2s0']
     conf = {'config': {
                 'usage_graph_style': 'bar',
                 'default_unit': 'mb',
                 'default_view': 'today',
                 'save_records_after': 7,
                 'startup_grace_period': 10,
-                'record_iface': ['wlp2s0', 'enp2s0']
+                'record_iface': default_ifaces
                 }
             }
 
 # remove tomllib and it's relateds after got the config's json safely
-del tomllib, TOMLDecodeError
+if 'tomllib' in locals() and tomllib is not None:
+    del tomllib, TOMLDecodeError
 
 
 running = True
@@ -261,6 +382,19 @@ def log_net_usage(wait=None, dry_run=False, verbose=False, json_output=False, if
         t = threading.Thread(target=record_iface, args=(iface_,), daemon=True)
         t.start()
         threads.append(t)
+
+    if not threads:
+        if sys.platform == 'darwin' and any(x in values for x in ('wlp2s0', 'enp2s0')):
+            print(f"{YELLOW}Linux interface names detected on macOS. Falling back to default macOS interface ('en0')...{RESET}\n")
+            if get_iface_counters('en0') is not None:
+                t = threading.Thread(target=record_iface, args=('en0',), daemon=True)
+                t.start()
+                threads.append(t)
+
+    if not threads:
+        print(f"\n{RED}No available network interfaces to record.{RESET}")
+        print(f"{YELLOW}Check your 'record_iface' setting in config.toml or specify --iface.{RESET}\n")
+        return
 
     for t in threads:
         t.join()
@@ -481,27 +615,34 @@ def fetch_net_usage(config, yesterday=False, today=False, thisweek=False, json_o
     total_up  = 0
     total_down = 0
 
-    for i in range(1, len(rows)):
-        t1, s1, r1, _ = rows[i - 1]
-        t2, s2, r2, _ = rows[i]
-        up   = max(0, s2 - s1)
-        down = max(0, r2 - r1)
-        dt   = datetime.fromtimestamp(t2)
+    iface_rows = defaultdict(list)
+    for r in rows:
+        iface_rows[r[3]].append(r)
 
-        if yesterday or today or date:
-            key = f"{dt.hour:02d}:00"
-        elif thisweek:
-            key = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][dt.weekday()]
-        elif month:
-            key = str(dt.day)
-        else:
-            key = dt.strftime("%Y-%m-%d")
+    for iface_name, iface_data in iface_rows.items():
+        for i in range(1, len(iface_data)):
+            t1, s1, r1, _ = iface_data[i - 1]
+            t2, s2, r2, _ = iface_data[i]
+            if s2 < s1 or r2 < r1:
+                continue
+            up   = max(0, s2 - s1)
+            down = max(0, r2 - r1)
+            dt   = datetime.fromtimestamp(t2)
 
-        buckets[key]["up"] += up
-        buckets[key]["down"] += down
+            if yesterday or today or date:
+                key = f"{dt.hour:02d}:00"
+            elif thisweek:
+                key = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][dt.weekday()]
+            elif month:
+                key = str(dt.day)
+            else:
+                key = dt.strftime("%Y-%m-%d")
 
-        total_up += up
-        total_down += down
+            buckets[key]["up"] += up
+            buckets[key]["down"] += down
+
+            total_up += up
+            total_down += down
 
     convert, unit = unit_type(conf, kb_show=kb_show, gb_show=gb_show)
 
@@ -571,6 +712,26 @@ def fetch_net_usage(config, yesterday=False, today=False, thisweek=False, json_o
 
 def db_stats(json_output=False):
     count  = conn.execute("SELECT COUNT(*) FROM data_usage").fetchone()[0]
+    size   = os.path.getsize(DB_FILE) / 1024 if os.path.exists(DB_FILE) else 0
+
+    if count == 0:
+        if json_output:
+            data = {
+                'records': 0,
+                'size_in_kb': size,
+                'oldest_record': None,
+                'newest_record': None,
+                'most_traffic': None,
+                'least_traffic': None
+            }
+            print(json.dumps(data, indent=3))
+        else:
+            print(f"\n  {BOLD}Database info{RESET}\n")
+            print(f"  {'Records':<18} 0")
+            print(f"  {'Size':<18} {size:.1f} KB  ({DB_FILE})")
+            print("  No records yet.")
+        return
+
     oldest = conn.execute("SELECT MIN(timestamp) FROM data_usage").fetchone()[0]
     newest = conn.execute("SELECT MAX(timestamp) FROM data_usage").fetchone()[0]
     most_traffic = conn.execute("""
@@ -587,7 +748,6 @@ def db_stats(json_output=False):
         GROUP BY day
         ORDER BY total ASC LIMIT 1
     """).fetchone()[0]
-    size   = os.path.getsize(DB_FILE) / 1024
 
     fmt_oldest = fmt_unixtime(oldest)
     fmt_newest = fmt_unixtime(newest)
@@ -706,8 +866,9 @@ if args.command in ("record", "db", "interfaces"):
             else:
                 db_stats(json_output=args.json)
     finally:
-        conn.commit()
-        conn.close()
+        if conn is not None:
+            conn.commit()
+            conn.close()
 else:
     fetch_kwargs = dict(json_output=args.json, kb_show=args.kilobyte, gb_show=args.gigabyte, style=args.style, iface=args.iface)
     fetch_net_usage(

@@ -20,4 +20,6 @@ save_records_after = 7
 startup_grace_period = 10
 
 # Record your desired interfaces usage parallelly (overrides if the 'iface' argument is passed)
+# Linux default: ['wlp2s0', 'enp2s0'] or ['eth0', 'wlan0']
+# macOS default: ['en0', 'en1']
 record_iface = ['wlp2s0', 'enp2s0']

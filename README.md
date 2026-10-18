@@ -1,6 +1,6 @@
 # Nusgmon - Network Usage Monitor
-Lightweight Python CLI (command-line interface) network usage monitor for Linux.
-Designed to run as a `systemd` service.
+Lightweight Python CLI (command-line interface) network usage monitor for Linux and macOS.
+Designed to run as a `systemd` service (Linux) or `launchd` daemon (macOS).
 
 [![Version 1.10.5](https://img.shields.io/badge/nusgmon-1.10.5-green.svg)](https://github.com/LUCKYS1NGHH/nusgmon)
 [![GitHub Stars](https://img.shields.io/github/stars/LUCKYS1NGHH/nusgmon?style=social)](https://github.com/LUCKYS1NGHH/nusgmon/stargazers)
@@ -49,7 +49,7 @@ Prune records before 30 days:
 
 - JSON output for scripting
 
-- Works with systemd
+- Works with systemd (Linux) and launchd (macOS)
 
 - Configuration file support
 
@@ -60,7 +60,7 @@ Prune records before 30 days:
 Requires Python 3 and psutil library.
 
 ```bash
-pip install psutil # or install `python-psutil` system-wide through your package manager
+pip install psutil # or install `python-psutil` through your package manager (apt, dnf, pacman, brew)
 ```
 
 ## Installation
@@ -70,10 +70,10 @@ pip install psutil # or install `python-psutil` system-wide through your package
 yay -S nusgmon-git
 ```
 
-#### For any other distro
+#### For macOS & other Linux distros
 
 The setup script installs the `nusgmon` program and performs the required
-file copy, permission, PATH variable etc. setup.
+file copy, permission, PATH variable, and service daemon (systemd / launchd) setup.
 
 ```bash
 git clone https://github.com/LUCKYS1NGHH/nusgmon.git
@@ -93,7 +93,7 @@ yay -R nusgmon-git
 > Optional (removes the database):
 > `rm -rf /var/lib/nusgmon`
 
-#### Other Distro
+#### Linux (systemd)
 
 ```bash
 sudo systemctl disable --now nusgmon
@@ -101,6 +101,17 @@ sudo rm /etc/systemd/system/nusgmon.service
 sudo rm /usr/local/bin/nusgmon
 sudo systemctl daemon-reload
 ```
+
+#### macOS (launchd)
+
+```bash
+sudo launchctl unload -w /Library/LaunchDaemons/com.luckys1nghh.nusgmon.plist
+sudo rm /Library/LaunchDaemons/com.luckys1nghh.nusgmon.plist
+sudo rm /usr/local/bin/nusgmon
+```
+
+> Optional (removes the database):
+> `sudo rm -rf /var/lib/nusgmon`
 
 </details>
 
